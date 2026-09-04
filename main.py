@@ -230,6 +230,11 @@ def cmd_hermes(task: str):
             return
 
     cwd = os.getcwd()
+    
+    # Build enriched task with context
+    context = _build_agent_context()
+    full_task = f"{task}\n\nWorking directory: {cwd}{context}" if task else ""
+
     print(f"\n  ╭─ Hermes Agent ─────────────────────────╮")
     if task:
         print(f"  │  Task : {task[:38]:<38} │")
@@ -237,8 +242,11 @@ def cmd_hermes(task: str):
     print(f"  ╰─────────────────────────────────────────╯\n")
 
     cmd = [hermes_exe]
-    if task:
-        cmd.append(task)
+    if full_task:
+        cmd.append(full_task)
+
+    # Snapshot files before agent runs
+    before = _snapshot_files(cwd)
 
     try:
         subprocess.run(cmd, env=os.environ, cwd=cwd)
@@ -246,6 +254,31 @@ def cmd_hermes(task: str):
         print("\n  [Interrupted]")
     except Exception as e:
         print(f"  [Error] {e}")
+
+    # Snapshot after and show diff
+    after = _snapshot_files(cwd)
+    created, modified, deleted = _diff_snapshots(before, after, cwd)
+
+    if created or modified or deleted:
+        print(f"\n  ╭─ Changes ───────────────────────────────╮")
+        for f in created:
+            print(f"  │  + {f:<40}│")
+        for f in modified:
+            print(f"  │  ~ {f:<40}│")
+        for f in deleted:
+            print(f"  │  - {f:<40}│")
+        print(f"  ╰──────────────────────────────────────────╯")
+
+        # Record in chat history
+        summary = []
+        if created: summary.append(f"Created: {', '.join(created)}")
+        if modified: summary.append(f"Modified: {', '.join(modified)}")
+        if deleted: summary.append(f"Deleted: {', '.join(deleted)}")
+        if task:
+            history.append({"role": "user", "content": f"[Hermes Agent completed task: {task}]"})
+        history.append({"role": "assistant", "content": f"Hermes Agent finished. {'; '.join(summary)}"})
+    else:
+        print("\n  No file changes detected.")
 
     print()
 
