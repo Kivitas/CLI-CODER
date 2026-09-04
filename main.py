@@ -88,6 +88,9 @@ def chat(user_msg: str, model: str) -> str:
         history.append({"role": "user", "content": user_msg})
         history.append({"role": "assistant", "content": reply})
         return None  # already printed
+    except KeyboardInterrupt:
+        print("\n  [Interrupted]\n")
+        return None
     except Exception as e:
         print(f"\n[Error] {e}\n")
         return None
@@ -145,31 +148,18 @@ def _diff_snapshots(before: dict, after: dict, directory: str) -> tuple:
     return created, modified, deleted
 
 
-def run_code_agent(task: str, model: str):
-    """Launch mini-swe-agent for a coding task with context and change tracking."""
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    mini_exe = os.path.join(script_dir, ".env_cli", "Scripts", "mini.exe")
-
-    if not os.path.isfile(mini_exe):
-        print("  [Error] mini-swe-agent not found. Re-run cli_coder.cmd to reinstall.")
-        return
-
+def _run_with_tracking(agent_name: str, cmd: list, task: str = ""):
+    """Wrapper to run any agent command with file diff tracking and chat logging."""
     cwd = os.getcwd()
 
-    # Build enriched task with context
-    context = _build_agent_context()
-    full_task = f"{task}\n\nWorking directory: {cwd}{context}"
-
-    print(f"\n  ╭─ Coding Agent ─────────────────────────╮")
-    print(f"  │  Task : {task[:38]:<38} │")
+    print(f"\n  ╭─ {agent_name} ─────────────────────────╮")
+    if task:
+        print(f"  │  Task : {task[:38]:<38} │")
     print(f"  │  CWD  : {cwd[:38]:<38} │")
-    print(f"  │  Model: {model[:38]:<38} │")
     print(f"  ╰─────────────────────────────────────────╯\n")
 
     # Snapshot files before agent runs
     before = _snapshot_files(cwd)
-
-    cmd = [mini_exe, "-t", full_task, "-y", "--model", model]
 
     try:
         subprocess.run(cmd, env=os.environ, cwd=cwd)
@@ -197,12 +187,31 @@ def run_code_agent(task: str, model: str):
         if created: summary.append(f"Created: {', '.join(created)}")
         if modified: summary.append(f"Modified: {', '.join(modified)}")
         if deleted: summary.append(f"Deleted: {', '.join(deleted)}")
-        history.append({"role": "user", "content": f"[Coding agent completed task: {task}]"})
-        history.append({"role": "assistant", "content": f"Coding agent finished. {'; '.join(summary)}"})
+        
+        if task:
+            history.append({"role": "user", "content": f"[{agent_name} completed task: {task}]"})
+        history.append({"role": "assistant", "content": f"{agent_name} finished. {'; '.join(summary)}"})
     else:
         print("\n  No file changes detected.")
 
     print()
+
+
+def run_code_agent(task: str, model: str):
+    """Launch mini-swe-agent for a coding task with context and change tracking."""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    mini_exe = os.path.join(script_dir, ".env_cli", "Scripts", "mini.exe")
+
+    if not os.path.isfile(mini_exe):
+        print("  [Error] mini-swe-agent not found. Re-run cli_coder.cmd to reinstall.")
+        return
+
+    cwd = os.getcwd()
+    context = _build_agent_context()
+    full_task = f"{task}\n\nWorking directory: {cwd}{context}"
+    cmd = [mini_exe, "-t", full_task, "-y", "--model", model]
+    
+    _run_with_tracking("Coding Agent", cmd, task)
 
 
 def cmd_hermes(task: str):
@@ -230,57 +239,14 @@ def cmd_hermes(task: str):
             return
 
     cwd = os.getcwd()
-    
-    # Build enriched task with context
     context = _build_agent_context()
     full_task = f"{task}\n\nWorking directory: {cwd}{context}" if task else ""
-
-    print(f"\n  ╭─ Hermes Agent ─────────────────────────╮")
-    if task:
-        print(f"  │  Task : {task[:38]:<38} │")
-    print(f"  │  CWD  : {cwd[:38]:<38} │")
-    print(f"  ╰─────────────────────────────────────────╯\n")
 
     cmd = [hermes_exe]
     if full_task:
         cmd.append(full_task)
 
-    # Snapshot files before agent runs
-    before = _snapshot_files(cwd)
-
-    try:
-        subprocess.run(cmd, env=os.environ, cwd=cwd)
-    except KeyboardInterrupt:
-        print("\n  [Interrupted]")
-    except Exception as e:
-        print(f"  [Error] {e}")
-
-    # Snapshot after and show diff
-    after = _snapshot_files(cwd)
-    created, modified, deleted = _diff_snapshots(before, after, cwd)
-
-    if created or modified or deleted:
-        print(f"\n  ╭─ Changes ───────────────────────────────╮")
-        for f in created:
-            print(f"  │  + {f:<40}│")
-        for f in modified:
-            print(f"  │  ~ {f:<40}│")
-        for f in deleted:
-            print(f"  │  - {f:<40}│")
-        print(f"  ╰──────────────────────────────────────────╯")
-
-        # Record in chat history
-        summary = []
-        if created: summary.append(f"Created: {', '.join(created)}")
-        if modified: summary.append(f"Modified: {', '.join(modified)}")
-        if deleted: summary.append(f"Deleted: {', '.join(deleted)}")
-        if task:
-            history.append({"role": "user", "content": f"[Hermes Agent completed task: {task}]"})
-        history.append({"role": "assistant", "content": f"Hermes Agent finished. {'; '.join(summary)}"})
-    else:
-        print("\n  No file changes detected.")
-
-    print()
+    _run_with_tracking("Hermes Agent", cmd, task)
 
 
 def cmd_analyze(model: str):
@@ -419,6 +385,16 @@ def cmd_read(args: str):
 
     for path in matches:
         name = os.path.relpath(path, cwd)
+        
+        # Prevent reading binary files
+        try:
+            with open(path, 'rb') as f:
+                if b'\x00' in f.read(1024):
+                    print(f"  [Error] Skipping binary file: {name}\n")
+                    continue
+        except Exception:
+            pass
+            
         try:
             with open(path, "r", encoding="utf-8", errors="replace") as f:
                 content = f.read(50000)  # Cap at 50KB
