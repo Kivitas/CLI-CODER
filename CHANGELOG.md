@@ -1,6 +1,11 @@
 # Changelog
 
-## v1.0.0 (2025-07-19)
+## v1.2.0 (2026-09-04)
+
+### Features
+- **Hermes Agent Integration**: Added `/hermes` command to auto-install and launch the self-improving Hermes Agent from Nous Research.
+
+## v1.1.0 (2026-07-19)
 
 ### Features
 - Interactive AI chat with streaming responses

@@ -10,6 +10,7 @@ CLI CODER provides a conversational interface powered by LiteLLM, plus a full co
 
 - **Zero Setup**: Build the launcher once (see [INSTALLATION.md](INSTALLATION.md)). It automatically downloads `uv`, creates a Python environment, installs dependencies, and patches Windows-specific bugs.
 - **Any Provider**: Built-in support for OpenAI, Anthropic, Gemini, Groq, and Mistral.
+- **Hermes Agent Integration**: Launch Nous Research's self-improving, persistent memory agent directly via `/hermes`. If you don't have it, CLI CODER will install it for you automatically.
 - **Streaming Chat**: Fast, real-time responses directly in your terminal.
 - **Coding Agent**: Use `/code <task>` as a universal tool. If you ask it to `analyse`, `explain`, or `summarize`, it uses a lightning-fast read path to instantly give you a summary without hitting API limits. If you ask it to fix a bug or add a feature, it unleashes an autonomous SWE agent that can edit files, run commands, and solve complex problems.
 - **Context Aware**: The agent reads your recent chat history and tracks file changes before and after it runs, providing a clean summary of what it modified.
@@ -30,6 +31,7 @@ Type naturally to chat with the AI. Use slash commands for advanced features:
 | Command | Description |
 |---------|-------------|
 | `/code <task>` | Smart coding assistant (fast-path for analysis, autonomous agent for bugs) |
+| `/hermes [task]` | Launch the self-improving Hermes Agent from Nous Research |
 | `/run <cmd>` | Run a shell command (output is fed to AI) |
 | `/ls [pattern]`| List files (supports glob, e.g., `/ls *.py`) |
 | `/read <file>` | Read file contents into chat context |

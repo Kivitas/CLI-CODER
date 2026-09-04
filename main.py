@@ -28,6 +28,7 @@ HELP_TEXT = """
   │                                              │
   │  Coding                                      │
   │    /code <task>    Start coding agent         │
+  │    /hermes [task]  Start Hermes Agent         │
   │    /run <cmd>      Run a shell command        │
   │                                              │
   │  Files                                       │
@@ -200,6 +201,51 @@ def run_code_agent(task: str, model: str):
         history.append({"role": "assistant", "content": f"Coding agent finished. {'; '.join(summary)}"})
     else:
         print("\n  No file changes detected.")
+
+    print()
+
+
+def cmd_hermes(task: str):
+    """Launch Hermes Agent or install it if missing."""
+    import platform
+    if platform.system() != "Windows":
+        print("  [Error] /hermes auto-install is currently only supported on Windows.")
+        return
+
+    localappdata = os.environ.get("LOCALAPPDATA")
+    if not localappdata:
+        print("  [Error] LOCALAPPDATA environment variable not found.")
+        return
+
+    hermes_exe = os.path.join(localappdata, "hermes", "bin", "hermes.exe")
+    
+    if not os.path.isfile(hermes_exe):
+        print("  [Info] Hermes Agent is not installed. Installing it now (this may take a few minutes)...")
+        install_cmd = "powershell -Command \"iex (irm https://hermes-agent.nousresearch.com/install.ps1)\""
+        try:
+            subprocess.run(install_cmd, shell=True, check=True)
+            print("  [Success] Hermes Agent installed successfully!")
+        except subprocess.CalledProcessError:
+            print("  [Error] Failed to install Hermes Agent.")
+            return
+
+    cwd = os.getcwd()
+    print(f"\n  ╭─ Hermes Agent ─────────────────────────╮")
+    if task:
+        print(f"  │  Task : {task[:38]:<38} │")
+    print(f"  │  CWD  : {cwd[:38]:<38} │")
+    print(f"  ╰─────────────────────────────────────────╯\n")
+
+    cmd = [hermes_exe]
+    if task:
+        cmd.append(task)
+
+    try:
+        subprocess.run(cmd, env=os.environ, cwd=cwd)
+    except KeyboardInterrupt:
+        print("\n  [Interrupted]")
+    except Exception as e:
+        print(f"  [Error] {e}")
 
     print()
 
@@ -561,6 +607,11 @@ def main():
                 continue
                 
             run_code_agent(task, model)
+            continue
+            
+        if low.startswith("/hermes"):
+            task = user_input[7:].strip()
+            cmd_hermes(task)
             continue
 
         if low.startswith("/"):
