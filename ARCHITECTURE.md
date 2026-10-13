@@ -18,6 +18,10 @@ The launcher is built locally rather than shipped, so Windows SmartScreen does n
 
 A `Session` dataclass holds the model, system prompt, chat history, usage totals and the last exchange. Commands receive it as an argument, so tests can create a fresh session without touching global state.
 
+### Providers
+
+`config.py` holds the provider table, `PROVIDERS`. Each entry has a name, a default LiteLLM model string, and either an API key variable or a local endpoint (Ollama). `ensure_setup()` runs the setup menu when no provider is configured, and `/key` runs it again. Routing is handled by LiteLLM from the model string's prefix (`xai/`, `openrouter/`, `ollama_chat/`, and so on). Ollama uses the `ollama_chat/` prefix because it calls the chat endpoint. `provider_of()` treats `ollama_chat` and `ollama` as one provider, so `/key` and `/models` compare them correctly.
+
 ### Command table
 
 Commands are registered with `@command("/name", ...)`. Each handler takes `(args, session)`. `handle_command()` splits the line, looks up the handler, and reports unknown commands. The REPL sends anything that does not start with `/` to `chat()`.

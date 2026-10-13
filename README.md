@@ -41,7 +41,7 @@ python patch_deps.py            # Windows only, applies the mini-swe-agent fixes
 python main.py
 ```
 
-The first run asks for a provider and API key, then stores them in `.env` (git-ignored).
+The first run asks you to pick a provider. It then asks for that provider's API key, or for the Ollama server address, and saves the result to `.env` (git-ignored).
 
 ## Providers
 
