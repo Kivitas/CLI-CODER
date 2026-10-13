@@ -154,8 +154,18 @@ class InstalledPackageTests(unittest.TestCase):
 
 
 class MainFunctionTests(unittest.TestCase):
+    def test_skips_on_non_windows_without_touching_the_package(self):
+        with patch.object(sys, "platform", "linux"), \
+                patch.object(patch_deps, "find_minisweagent_dir") as finder, \
+                patch("builtins.print") as printed:
+            self.assertEqual(patch_deps.main(), 0)
+        finder.assert_not_called()
+        self.assertIn("Windows only", printed.call_args.args[0])
+
     def test_reports_missing_package(self):
-        with patch.object(patch_deps, "find_minisweagent_dir", return_value=None), \
+        # Pin the platform so this checks the missing-package path on every OS, including the Ubuntu runner.
+        with patch.object(sys, "platform", "win32"), \
+                patch.object(patch_deps, "find_minisweagent_dir", return_value=None), \
                 patch("builtins.print") as printed:
             self.assertEqual(patch_deps.main(), 1)
         self.assertIn("not installed", printed.call_args.args[0])
