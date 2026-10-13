@@ -1,55 +1,128 @@
 # CLI CODER
 
-A lightweight, zero-setup terminal AI assistant and coding agent for Windows.
+[![CI](https://github.com/Kivitas/CLI-CODER/actions/workflows/ci.yml/badge.svg)](https://github.com/Kivitas/CLI-CODER/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-CLI CODER provides a conversational interface powered by LiteLLM, plus a full coding agent (`mini-swe-agent`) that can write code, run terminal commands, and solve tasks autonomously directly in your workspace.
+A lightweight, zero-setup terminal AI assistant and coding agent. Built for Windows. The test suite also runs on Ubuntu in CI.
+
+CLI CODER gives you a streaming chat with any major model provider, plus a coding agent (`mini-swe-agent`) that can edit files and run commands in your project. It reports token use and cost as you go.
 
 ![CLI CODER Demo](screenshots/demo.png)
 
 ## Features
 
-- **Zero Setup**: Build the launcher once (see [INSTALLATION.md](INSTALLATION.md)). It automatically downloads `uv`, creates a Python environment, installs dependencies, and patches Windows-specific bugs.
-- **Any Provider**: Built-in support for OpenAI, Anthropic, Gemini, Groq, and Mistral.
-- **Hermes Agent Integration**: Launch Nous Research's self-improving, persistent memory agent directly via `/hermes`. If you don't have it, CLI CODER will install it for you automatically.
-- **Streaming Chat**: Fast, real-time responses directly in your terminal.
-- **Coding Agent**: Use `/code <task>` as a universal tool. If you ask it to `analyse`, `explain`, or `summarize`, it uses a lightning-fast read path to instantly give you a summary without hitting API limits. If you ask it to fix a bug or add a feature, it unleashes an autonomous SWE agent that can edit files, run commands, and solve complex problems.
-- **Context Aware**: The agent reads your recent chat history and tracks file changes before and after it runs, providing a clean summary of what it modified.
-- **Workspace Tools**: Read files (`/read`), list directories (`/ls`, `/tree`), and execute shell commands (`/run`) directly from chat. Include `/analyze` to manually trigger a one-shot project summary.
+- **Zero setup on Windows**: build the launcher once (see [INSTALLATION.md](INSTALLATION.md)). It installs `uv`, creates a Python environment, and applies the Windows patches for you.
+- **Eight providers out of the box**: OpenAI, Anthropic (Claude), Google Gemini, xAI (Grok), OpenRouter, Groq, Mistral, and Ollama for models that run on your own machine. Any [LiteLLM](https://docs.litellm.ai/docs/providers) model string works with `/model`.
+- **Markdown rendering**: replies are formatted as they stream in (headings, lists, code blocks).
+- **Token and cost tracking**: every reply shows tokens and cost, and `/info` shows session totals.
+- **Long chats stay within budget**: older messages are left out of each request when the context budget is reached. They stay in `/history` and `/save`.
+- **Retry and copy**: `/retry` regenerates the last answer, and `/copy` puts it on the clipboard.
+- **One-shot mode**: `python main.py "question"` prints one answer and exits, which suits scripts.
+- **Coding agent**: `/code <task>` runs an autonomous agent for bugs and features, then lists every file it created, changed or deleted. Simple requests like `/code summarize` take a fast path instead.
+- **Hermes Agent**: `/hermes` launches Nous Research's persistent-memory agent and offers to install it if it is missing.
+- **Workspace tools**: `/ls`, `/tree`, `/read`, `/run` and `/analyze` work from inside the chat. `/run` has a timeout and can be interrupted with Ctrl+C.
+- **Tested**: unit tests and linting run in GitHub Actions on Windows and Ubuntu.
 
-## Installation
+## Quick start
+
+### Windows (launcher)
 
 1. Clone or download this repository.
-2. Read [INSTALLATION.md](INSTALLATION.md) for a 3-step guide on how to build your local `.cmd` launcher.
-3. Once built, double-click your new `cli_coder.cmd` to set up everything and launch the assistant.
+2. Build `cli_coder.cmd` once, as described in [INSTALLATION.md](INSTALLATION.md).
+3. Double-click `cli_coder.cmd`. It sets everything up and starts the chat.
+
+### From source
+
+```bash
+python -m venv .venv
+.venv\Scripts\activate          # Windows (use source .venv/bin/activate elsewhere)
+pip install -r requirements.txt
+python patch_deps.py            # Windows only, applies the mini-swe-agent fixes
+python main.py
+```
+
+The first run asks for a provider and API key, then stores them in `.env` (git-ignored).
+
+## Providers
+
+The first run asks you to pick one. Run `/key` later to add or switch providers, and `/models` to see what is set up.
+
+| Provider | Default model | What you need |
+|----------|---------------|---------------|
+| OpenAI | `openai/gpt-5.6` | `OPENAI_API_KEY` |
+| Anthropic (Claude) | `anthropic/claude-sonnet-5-5` | `ANTHROPIC_API_KEY` |
+| Google Gemini | `gemini/gemini-3.5-flash` | `GEMINI_API_KEY` |
+| xAI (Grok) | `xai/grok-4.6` | `XAI_API_KEY` |
+| OpenRouter | `openrouter/openrouter/auto` | `OPENROUTER_API_KEY` (one key, many models) |
+| Groq | `groq/openai/gpt-oss-120b` | `GROQ_API_KEY` |
+| Mistral | `mistral/mistral-large-latest` | `MISTRAL_API_KEY` |
+| Ollama (local) | `ollama_chat/llama3.2` | Nothing. Runs on your machine. Set `OLLAMA_API_BASE` if it is not on `http://localhost:11434`. |
+
+For Ollama, start the server with `ollama serve` and download the model once with `ollama pull llama3.2`.
+
+The defaults are starting points. Switch with `/model <provider/model>` to use any model your provider offers. Model names change often, so check your provider's model list if one stops working.
 
 ## Usage
 
-Type naturally to chat with the AI. Use slash commands for advanced features:
+Type normally to chat. Use slash commands for everything else:
 
-### Slash Commands
+```bash
+python main.py                          # interactive chat
+python main.py "explain this regex"     # one answer, then exit
+python main.py --version
+```
+
+### Slash commands
 
 | Command | Description |
 |---------|-------------|
-| `/code <task>` | Smart coding assistant (fast-path for analysis, autonomous agent for bugs) |
-| `/hermes [task]` | Launch the self-improving Hermes Agent from Nous Research |
-| `/run <cmd>` | Run a shell command (output is fed to AI) |
-| `/ls [pattern]`| List files (supports glob, e.g., `/ls *.py`) |
-| `/read <file>` | Read file contents into chat context |
-| `/tree` | Show directory structure |
-| `/analyze` | Summarize the project quickly |
-| `/cwd <path>` | Change working directory |
-| `/system <msg>`| Set a custom system prompt |
-| `/history` | Show conversation log |
-| `/save` | Export chat to a `.md` file |
-| `/clear` | Clear chat history |
-| `/model <name>`| Change AI model (e.g., `gemini/gemini-1.5-pro`) |
-| `/key` | Switch provider / API key |
-| `/info` | Show current settings, CWD, and token usage |
-| `/reset` | Wipe config and start fresh |
+| `/code <task>` | Coding agent for bugs and features. Simple analysis requests take a fast path. |
+| `/hermes [task]` | Launch Hermes Agent (offers to install it first) |
+| `/run <cmd>` | Run a shell command with a 120 s timeout. The output goes into the chat. |
+| `/ls [pattern]` | List files, with glob support (e.g. `/ls *.py`) |
+| `/read <file>` | Load file contents into the chat (supports globs) |
+| `/cwd <path>` | Change the working directory |
+| `/tree` | Show the directory structure |
+| `/analyze` | Summarize the project |
+| `/system <msg>` | Set a system prompt (`/system clear` removes it) |
+| `/retry` | Regenerate the last reply |
+| `/copy` | Copy the last reply to the clipboard (Windows, macOS, or Linux with `xclip`/`wl-copy`) |
+| `/history` | Show the conversation log |
+| `/save` | Export the chat to a `.md` file in the current folder |
+| `/clear` | Clear the chat history and system prompt |
+| `/model [name]` | Show or change the model (e.g. `/model anthropic/claude-sonnet-5-5`) |
+| `/models` | List providers, their default models, and which are set up |
+| `/key` | Set up or switch provider (API key, or the Ollama address) |
+| `/info` | Show settings, the context budget, and session token and cost totals |
+| `/reset` | Delete the saved config and start fresh |
+| `/help` | Show the command list |
+| `exit` | Quit |
 
-## Architecture
+### Settings
 
-CLI CODER uses a dual-mode architecture. For full technical details on how the ReAct agent routing and Windows-specific patch system works, please see [ARCHITECTURE.md](ARCHITECTURE.md).
+Stored in `.env` next to `main.py`, or set as environment variables:
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `CLI_CODER_MODEL` | set on first run | Model in use (also changed by `/model`) |
+| `CLI_CODER_CONTEXT_CHARS` | `120000` | Characters of history sent per request. Lower it for small-context models. |
+| `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `XAI_API_KEY`, `OPENROUTER_API_KEY`, `GROQ_API_KEY`, `MISTRAL_API_KEY` | none | Provider API keys |
+| `OLLAMA_API_BASE` | `http://localhost:11434` | Where your Ollama server listens |
+
+Notes:
+
+- Token counts come from the provider when it reports them. Counts shown with a `~` are estimates.
+- Cost comes from LiteLLM's price table. Models it does not know are shown as `cost n/a`.
+- `/code` runs the agent in auto-approve mode (`-y`), so it edits files without asking. Run it in a project you are happy to have changed.
+
+## Development
+
+```bash
+python -m unittest -v      # run the test suite
+ruff check .               # lint
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the workflow and [ARCHITECTURE.md](ARCHITECTURE.md) for how the pieces fit together. Security issues: see [SECURITY.md](SECURITY.md).
 
 ## License
 

@@ -64,3 +64,25 @@ endlocal
 Save the file and close Notepad. 
 
 Now you can simply double-click `cli_coder.cmd` anytime you want to launch the AI. It will automatically download dependencies, create an isolated Python environment, and start the CLI without any Windows Defender warnings!
+
+---
+
+## Upgrading from an earlier version
+
+Versions before v1.3.0 installed an unpinned `mini-swe-agent` and an older Windows patch, which could make `/code` fail when the agent finished. To pick up the fix, delete the `.env_cli` folder in the CLI CODER folder and run `cli_coder.cmd` again. Your `.env` file (keys and model) and chat history are kept.
+
+## Run from source (no launcher)
+
+If you'd rather not build the `.cmd` file, use Python directly. Python 3.12 or newer is required.
+
+```bash
+python -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt
+python patch_deps.py
+python main.py
+```
+
+`python patch_deps.py` applies the Windows fixes to the installed `mini-swe-agent`. Run it again after reinstalling dependencies. Skip it on macOS and Linux, where it does nothing.
+
+To check that it works without an API key, run `python main.py --version`.

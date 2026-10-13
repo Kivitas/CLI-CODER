@@ -1,0 +1,7 @@
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+# Pyflakes plus the checks that catch real errors. Style rules are left out on purpose.
+select = ["E4", "E7", "E9", "F"]

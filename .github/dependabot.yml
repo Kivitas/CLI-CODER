@@ -1,0 +1,12 @@
+version: 2
+updates:
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    # litellm and mini-swe-agent are pinned on purpose (see requirements.txt).
+    # Review their update PRs carefully and run the patch checks before merging.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"

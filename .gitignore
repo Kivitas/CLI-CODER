@@ -1,5 +1,12 @@
 .env
 .env_cli/
 uv.exe
+uv.zip
+uv_extracted/
 __pycache__/
 *.pyc
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+.omc/

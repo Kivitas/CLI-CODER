@@ -1,0 +1,77 @@
+name: Bug report
+description: Something in CLI CODER is not working as expected
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. Please fill in as much as you can. **Never paste your API keys**, and remove them from `.env` output and logs before sharing.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Run `python main.py`
+        2. Type `/code ...`
+        3. See error
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: CLI CODER version
+      description: Output of `python main.py --version`
+      placeholder: "CLI CODER 1.3.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Windows 11
+        - Windows 10
+        - macOS
+        - Linux
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      placeholder: "3.12.x"
+  - type: input
+    id: model
+    attributes:
+      label: Model / provider
+      description: For example `anthropic/claude-sonnet-5-5`. Leave out any key.
+  - type: dropdown
+    id: command
+    attributes:
+      label: Which feature is involved?
+      options:
+        - Chat (streaming reply)
+        - /code (coding agent)
+        - /hermes
+        - /run or file commands
+        - Installation or setup
+        - Other
+  - type: textarea
+    id: logs
+    attributes:
+      label: Error output or logs
+      description: Paste the terminal output. Redact keys and personal paths.
+      render: text

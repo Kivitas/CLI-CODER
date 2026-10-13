@@ -2,14 +2,42 @@
 CLI CODER — A terminal AI assistant.
   Normal chat  → direct LLM API call (via litellm) with streaming
   Coding tasks → /code <task> routes to mini-swe-agent with full context
+  One-shot     → python main.py "question" prints one answer and exits
 """
-import os
-import sys
-import subprocess
+import argparse
 import datetime
 import glob
+import os
+import platform
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+from dataclasses import dataclass, field
+
 import litellm
-from config import ensure_setup
+from rich.console import Console, Group
+from rich.live import Live
+from rich.markdown import Markdown
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
+
+import config
+from config import (
+    MODEL_ENV,
+    PROVIDERS,
+    choose_provider,
+    configured_providers,
+    ensure_setup,
+    mask_key,
+    provider_of,
+)
+
+__version__ = "1.3.0"
+
+litellm.suppress_debug_info = True
 
 BANNER = r"""
    ____ _     ___        ____ ___  ____  _____ ____
@@ -21,286 +49,500 @@ BANNER = r"""
          Made by Kivitas : github.com/kivitas
 """
 
-HELP_TEXT = """
-  ╭──────────────────────────────────────────────╮
-  │               COMMANDS                       │
-  ├──────────────────────────────────────────────┤
-  │                                              │
-  │  Coding                                      │
-  │    /code <task>    Start coding agent         │
-  │    /hermes [task]  Start Hermes Agent         │
-  │    /run <cmd>      Run a shell command        │
-  │                                              │
-  │  Files                                       │
-  │    /ls [pattern]   List files (supports glob) │
-  │    /read <file>    Read file into chat        │
-  │    /cwd <path>     Change working directory   │
-  │    /tree           Show directory tree        │
-  │    /analyze        Summarize the project      │
-  │                                              │
-  │  Chat                                        │
-  │    /system <text>  Set system prompt          │
-  │    /history        Show conversation log      │
-  │    /save           Save chat to .md file      │
-  │    /clear          Clear chat history         │
-  │                                              │
-  │  Config                                      │
-  │    /model <name>   Change AI model            │
-  │    /key            Change API key / provider  │
-  │    /info           Show current settings      │
-  │    /reset          Wipe config & start fresh  │
-  │                                              │
-  │  /help             Show this help             │
-  │  exit              Quit                       │
-  ╰──────────────────────────────────────────────╯
-"""
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ[name])
+    except (KeyError, ValueError):
+        return default
+
+
+# Characters of history (plus the system prompt and the new message) sent per request.
+# Older messages are left out of the request, but they stay in /history and /save.
+CONTEXT_BUDGET_CHARS = _env_int("CLI_CODER_CONTEXT_CHARS", 120_000)
+CHAT_TIMEOUT_SECONDS = 120
+RUN_TIMEOUT_SECONDS = 120
+MAX_READ_CHARS = 50_000
+MAX_SNAPSHOT_FILES = 20_000
+SKIP_DIRS = {"node_modules", "__pycache__", "venv"}
+ANALYSIS_WORDS = ("analyse", "analyze", "summarize", "explain", "summary")
+
+console = Console()
+
 
 # ─── State ────────────────────────────────────────────────────
 
-history = []
-system_prompt = None
-total_tokens = 0
+@dataclass
+class Usage:
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    cost: float = 0.0
+    unpriced_replies: int = 0
+
+    def record(self, prompt_tokens: int, completion_tokens: int, cost: float | None):
+        self.prompt_tokens += prompt_tokens
+        self.completion_tokens += completion_tokens
+        if cost is None:
+            self.unpriced_replies += 1
+        else:
+            self.cost += cost
 
 
-# ─── Chat (streaming) ────────────────────────────────────────
+@dataclass
+class Session:
+    model: str
+    system_prompt: str | None = None
+    history: list = field(default_factory=list)
+    usage: Usage = field(default_factory=Usage)
+    last_prompt: str | None = None
+    last_reply: str | None = None
 
-def chat(user_msg: str, model: str) -> str:
-    """Send a message to the LLM and stream the response."""
-    global total_tokens
+
+# ─── Output helpers ───────────────────────────────────────────
+
+def show_error(message: str):
+    console.print(Text(f"[Error] {message}", style="red"))
+
+
+def print_panel(title: str, rows):
+    table = Table.grid(padding=(0, 2))
+    table.add_column(style="bold cyan", no_wrap=True)
+    table.add_column(overflow="fold")
+    for label, value in rows:
+        table.add_row(Text(str(label)), Text(str(value)))
+    console.print(Panel(table, title=title, title_align="left", border_style="dim", expand=False))
+
+
+def _truncate(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[:limit] + "..."
+
+
+def _format_size(size: int) -> str:
+    if size < 1024:
+        return f"{size} B"
+    if size < 1024 * 1024:
+        return f"{size // 1024} KB"
+    return f"{size // (1024 * 1024)} MB"
+
+
+# ─── Chat (streaming) ─────────────────────────────────────────
+
+def estimate_tokens(text: str) -> int:
+    """Rough token count (about 4 characters per token), used when the provider reports no usage."""
+    return len(text) // 4 if text else 0
+
+
+def build_messages(s: Session, user_msg: str) -> tuple[list, int]:
+    """Build the request messages. Returns (messages, number of history messages left out)."""
+    reserved = len(user_msg) + (len(s.system_prompt) if s.system_prompt else 0)
+    budget = CONTEXT_BUDGET_CHARS - reserved
+
+    kept = []
+    used = 0
+    for msg in reversed(s.history):
+        size = len(msg["content"])
+        if used + size > budget:
+            break
+        kept.append(msg)
+        used += size
+    kept.reverse()
+
+    dropped = len(s.history) - len(kept)
+    # Most providers expect the conversation to start with a user turn.
+    while kept and kept[0]["role"] != "user":
+        kept.pop(0)
+        dropped += 1
+
     messages = []
-    if system_prompt:
-        messages.append({"role": "system", "content": system_prompt})
-    messages.extend(history)
+    if s.system_prompt:
+        messages.append({"role": "system", "content": s.system_prompt})
+    messages.extend(kept)
     messages.append({"role": "user", "content": user_msg})
+    return messages, dropped
+
+
+def stream_reply(messages: list, model: str) -> tuple[str, list]:
+    """Stream a reply, rendering the Markdown as it arrives. Returns (reply text, raw chunks)."""
+    chunks = []
+    parts = []
+    with Live(Markdown(""), console=console, refresh_per_second=10, vertical_overflow="visible") as live:
+        for chunk in litellm.completion(model=model, messages=messages, stream=True, timeout=CHAT_TIMEOUT_SECONDS):
+            chunks.append(chunk)
+            if not chunk.choices:
+                continue
+            content = getattr(chunk.choices[0].delta, "content", None)
+            if content:
+                parts.append(content)
+                live.update(Markdown("".join(parts)))
+    return "".join(parts), chunks
+
+
+def measure_reply(chunks: list, messages: list, reply: str):
+    """Return (prompt_tokens, completion_tokens, cost or None, estimated) for one reply."""
+    response = None
+    try:
+        response = litellm.stream_chunk_builder(chunks, messages=messages)
+    except Exception:
+        response = None
+
+    usage = getattr(response, "usage", None)
+    if usage is not None and (usage.total_tokens or 0) > 0:
+        prompt_tokens, completion_tokens, estimated = usage.prompt_tokens or 0, usage.completion_tokens or 0, False
+    else:
+        prompt_tokens = estimate_tokens("".join(m["content"] for m in messages))
+        completion_tokens = estimate_tokens(reply)
+        estimated = True
+
+    cost = None
+    if response is not None:
+        try:
+            cost = litellm.completion_cost(completion_response=response)
+        except Exception:
+            cost = None
+    return prompt_tokens, completion_tokens, cost, estimated
+
+
+def chat(user_msg: str, s: Session) -> bool:
+    """Send a message to the LLM, stream the reply and record it. Returns True on success."""
+    messages, dropped = build_messages(s, user_msg)
+    if dropped:
+        console.print(Text(f"  ({dropped} older message(s) left out to fit the context budget)", style="dim"))
+    console.print("\n[bold cyan]AI >[/bold cyan]")
 
     try:
-        response = litellm.completion(model=model, messages=messages, stream=True)
-        print("\nAI > ", end="", flush=True)
-        full_reply = []
-        for chunk in response:
-            delta = chunk.choices[0].delta
-            if delta and delta.content:
-                print(delta.content, end="", flush=True)
-                full_reply.append(delta.content)
-        reply = "".join(full_reply)
-        print("\n")
-
-        history.append({"role": "user", "content": user_msg})
-        history.append({"role": "assistant", "content": reply})
-        return None  # already printed
+        reply, chunks = stream_reply(messages, s.model)
     except KeyboardInterrupt:
         print("\n  [Interrupted]\n")
-        return None
+        return False
     except Exception as e:
-        print(f"\n[Error] {e}\n")
-        return None
+        show_error(str(e))
+        print()
+        return False
+
+    prompt_tokens, completion_tokens, cost, estimated = measure_reply(chunks, messages, reply)
+    s.usage.record(prompt_tokens, completion_tokens, cost)
+
+    s.history.append({"role": "user", "content": user_msg})
+    s.history.append({"role": "assistant", "content": reply})
+    s.last_prompt = user_msg
+    s.last_reply = reply
+
+    prefix = "~" if estimated else ""
+    footer = f"tokens {prefix}{prompt_tokens:,} in | {prefix}{completion_tokens:,} out"
+    if cost is None:
+        footer += " | cost n/a"
+    elif cost:
+        footer += f" | ${cost:.4f}"
+    console.print()  # the live Markdown view does not end its own line
+    console.print(Text(f"  {footer}", style="dim"))
+    console.print()
+    return True
 
 
 # ─── SWE Agent ────────────────────────────────────────────────
 
-def _build_agent_context() -> str:
+def build_agent_context(s: Session) -> str:
     """Build context from recent chat history to give the coding agent."""
-    if not history:
+    if not s.history:
         return ""
-    # Take last 6 messages max
-    recent = history[-6:]
     lines = ["\n## Recent conversation context:"]
-    for msg in recent:
+    for msg in s.history[-6:]:
         role = "User" if msg["role"] == "user" else "Assistant"
-        content = msg["content"]
-        if len(content) > 500:
-            content = content[:500] + "..."
-        lines.append(f"{role}: {content}")
+        lines.append(f"{role}: {_truncate(msg['content'], 500)}")
     return "\n".join(lines)
 
 
-def _snapshot_files(directory: str) -> dict:
-    """Take a snapshot of file modification times."""
+def snapshot_files(directory: str) -> tuple[dict, bool]:
+    """Map each file path to its mtime. Returns (snapshot, truncated) where truncated means the tree was too big."""
     snap = {}
-    try:
-        for root, dirs, files in os.walk(directory):
-            # Skip hidden dirs and common noise
-            dirs[:] = [d for d in dirs if not d.startswith('.') and d not in ('node_modules', '__pycache__', 'venv')]
-            for f in files:
-                fp = os.path.join(root, f)
-                try:
-                    snap[fp] = os.path.getmtime(fp)
-                except OSError:
-                    pass
-    except OSError:
-        pass
-    return snap
+    for root, dirs, files in os.walk(directory):
+        dirs[:] = [d for d in dirs if not d.startswith(".") and d not in SKIP_DIRS]
+        for name in files:
+            path = os.path.join(root, name)
+            try:
+                snap[path] = os.path.getmtime(path)
+            except OSError:
+                continue
+            if len(snap) > MAX_SNAPSHOT_FILES:
+                return snap, True
+    return snap, False
 
 
-def _diff_snapshots(before: dict, after: dict, directory: str) -> tuple:
-    """Compare snapshots and return (created, modified, deleted) file lists."""
+def diff_snapshots(before: dict, after: dict, directory: str) -> tuple[list, list, list]:
+    """Compare two snapshots and return (created, modified, deleted) as relative paths."""
     created = []
     modified = []
     deleted = []
-    for fp, mtime in after.items():
-        if fp not in before:
-            created.append(os.path.relpath(fp, directory))
-        elif mtime != before[fp]:
-            modified.append(os.path.relpath(fp, directory))
-    for fp in before:
-        if fp not in after:
-            deleted.append(os.path.relpath(fp, directory))
+    for path, mtime in after.items():
+        if path not in before:
+            created.append(os.path.relpath(path, directory))
+        elif mtime != before[path]:
+            modified.append(os.path.relpath(path, directory))
+    for path in before:
+        if path not in after:
+            deleted.append(os.path.relpath(path, directory))
     return created, modified, deleted
 
 
-def _run_with_tracking(agent_name: str, cmd: list, task: str = ""):
-    """Wrapper to run any agent command with file diff tracking and chat logging."""
+def run_with_tracking(agent_name: str, cmd: list, task: str, s: Session):
+    """Run an agent command, then show which files it created, changed or deleted."""
     cwd = os.getcwd()
+    rows = [("Task", _truncate(task, 60))] if task else []
+    rows.append(("CWD", cwd))
+    print_panel(agent_name, rows)
 
-    print(f"\n  ╭─ {agent_name} ─────────────────────────╮")
-    if task:
-        print(f"  │  Task : {task[:38]:<38} │")
-    print(f"  │  CWD  : {cwd[:38]:<38} │")
-    print(f"  ╰─────────────────────────────────────────╯\n")
-
-    # Snapshot files before agent runs
-    before = _snapshot_files(cwd)
-
+    before, before_truncated = snapshot_files(cwd)
     try:
         subprocess.run(cmd, env=os.environ, cwd=cwd)
     except KeyboardInterrupt:
         print("\n  [Interrupted]")
     except Exception as e:
-        print(f"  [Error] {e}")
+        show_error(str(e))
+    after, after_truncated = snapshot_files(cwd)
 
-    # Snapshot after and show diff
-    after = _snapshot_files(cwd)
-    created, modified, deleted = _diff_snapshots(before, after, cwd)
+    if before_truncated or after_truncated:
+        print("  (Too many files to track changes in this folder; skipping the change summary.)\n")
+        return
 
-    if created or modified or deleted:
-        print(f"\n  ╭─ Changes ───────────────────────────────╮")
-        for f in created:
-            print(f"  │  + {f:<40}│")
-        for f in modified:
-            print(f"  │  ~ {f:<40}│")
-        for f in deleted:
-            print(f"  │  - {f:<40}│")
-        print(f"  ╰──────────────────────────────────────────╯")
+    created, modified, deleted = diff_snapshots(before, after, cwd)
+    if not (created or modified or deleted):
+        print("  No file changes detected.\n")
+        return
 
-        # Record in chat history
-        summary = []
-        if created: summary.append(f"Created: {', '.join(created)}")
-        if modified: summary.append(f"Modified: {', '.join(modified)}")
-        if deleted: summary.append(f"Deleted: {', '.join(deleted)}")
-        
-        if task:
-            history.append({"role": "user", "content": f"[{agent_name} completed task: {task}]"})
-        history.append({"role": "assistant", "content": f"{agent_name} finished. {'; '.join(summary)}"})
-    else:
-        print("\n  No file changes detected.")
+    lines = [Text(f"+ {f}", style="green") for f in created]
+    lines += [Text(f"~ {f}", style="yellow") for f in modified]
+    lines += [Text(f"- {f}", style="red") for f in deleted]
+    console.print(Panel(Group(*lines), title="Changes", title_align="left", border_style="dim", expand=False))
 
+    summary = []
+    if created:
+        summary.append(f"Created: {', '.join(created)}")
+    if modified:
+        summary.append(f"Modified: {', '.join(modified)}")
+    if deleted:
+        summary.append(f"Deleted: {', '.join(deleted)}")
+    if task:
+        s.history.append({"role": "user", "content": f"[{agent_name} completed task: {task}]"})
+    s.history.append({"role": "assistant", "content": f"{agent_name} finished. {'; '.join(summary)}"})
     print()
 
 
-def run_code_agent(task: str, model: str):
-    """Launch mini-swe-agent for a coding task with context and change tracking."""
+def find_mini_exe() -> str | None:
+    """Find the mini-swe-agent entry point: next to this Python, in the launcher venv, or on PATH."""
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    mini_exe = os.path.join(script_dir, ".env_cli", "Scripts", "mini.exe")
+    candidate_dirs = [
+        os.path.dirname(sys.executable),
+        os.path.join(script_dir, ".env_cli", "Scripts"),
+        os.path.join(script_dir, ".env_cli", "bin"),
+    ]
+    for directory in candidate_dirs:
+        found = shutil.which("mini", path=directory)
+        if found:
+            return found
+    return shutil.which("mini")
 
-    if not os.path.isfile(mini_exe):
-        print("  [Error] mini-swe-agent not found. Re-run cli_coder.cmd to reinstall.")
+
+def run_code_agent(task: str, s: Session):
+    """Launch mini-swe-agent for a coding task with context and change tracking."""
+    mini = find_mini_exe()
+    if not mini:
+        show_error("mini-swe-agent not found. Re-run cli_coder.cmd, or run: pip install -r requirements.txt\n")
         return
 
     cwd = os.getcwd()
-    context = _build_agent_context()
-    full_task = f"{task}\n\nWorking directory: {cwd}{context}"
-    cmd = [mini_exe, "-t", full_task, "-y", "--model", model]
-    
-    _run_with_tracking("Coding Agent", cmd, task)
+    full_task = f"{task}\n\nWorking directory: {cwd}{build_agent_context(s)}"
+    # --exit-immediately: the agent exits when it finishes instead of waiting for follow-up input,
+    # so the change summary below appears right away.
+    cmd = [mini, "-t", full_task, "-y", "--exit-immediately", "--model", s.model]
+    run_with_tracking("Coding Agent", cmd, task, s)
 
 
-def cmd_hermes(task: str):
-    """Launch Hermes Agent or install it if missing."""
-    import platform
+def install_hermes(hermes_exe: str) -> bool:
+    install_cmd = "powershell -Command \"iex (irm https://hermes-agent.nousresearch.com/install.ps1)\""
+    try:
+        subprocess.run(install_cmd, shell=True, check=True)
+    except subprocess.CalledProcessError:
+        return False
+    return os.path.isfile(hermes_exe)
+
+
+def run_hermes(task: str, s: Session):
+    """Launch Hermes Agent, installing it first (after confirmation) if it is missing."""
     if platform.system() != "Windows":
-        print("  [Error] /hermes auto-install is currently only supported on Windows.")
+        print("  [Error] /hermes auto-install is currently only supported on Windows.\n")
         return
 
     localappdata = os.environ.get("LOCALAPPDATA")
     if not localappdata:
-        print("  [Error] LOCALAPPDATA environment variable not found.")
+        print("  [Error] LOCALAPPDATA environment variable not found.\n")
         return
 
     hermes_exe = os.path.join(localappdata, "hermes", "bin", "hermes.exe")
-    
     if not os.path.isfile(hermes_exe):
-        print("  [Info] Hermes Agent is not installed. Installing it now (this may take a few minutes)...")
-        install_cmd = "powershell -Command \"iex (irm https://hermes-agent.nousresearch.com/install.ps1)\""
-        try:
-            subprocess.run(install_cmd, shell=True, check=True)
-            print("  [Success] Hermes Agent installed successfully!")
-        except subprocess.CalledProcessError:
-            print("  [Error] Failed to install Hermes Agent.")
+        print("  [Info] Hermes Agent is not installed.")
+        print("  Installing it runs the install script from https://hermes-agent.nousresearch.com/install.ps1")
+        answer = input("  Download and run it now? [y/N]: ").strip().lower()
+        if answer != "y":
+            print("  Cancelled.\n")
             return
+        print("  Installing Hermes Agent (this may take a few minutes)...")
+        if not install_hermes(hermes_exe):
+            print(f"  [Error] Hermes Agent install failed, or hermes.exe was not found at {hermes_exe}.\n")
+            return
+        print("  [Success] Hermes Agent installed!")
 
     cwd = os.getcwd()
-    context = _build_agent_context()
-    full_task = f"{task}\n\nWorking directory: {cwd}{context}" if task else ""
-
+    full_task = f"{task}\n\nWorking directory: {cwd}{build_agent_context(s)}" if task else ""
     cmd = [hermes_exe]
     if full_task:
         cmd.append(full_task)
-
-    _run_with_tracking("Hermes Agent", cmd, task)
-
-
-def cmd_analyze(model: str):
-    """Quickly summarize the codebase without launching the SWE agent."""
-    cwd = os.getcwd()
-    print("\n  Analyzing project... (reading context)")
-    context = []
-    
-    # Read README.md if it exists
-    readme_path = os.path.join(cwd, "README.md")
-    if os.path.isfile(readme_path):
-        with open(readme_path, "r", encoding="utf-8", errors="ignore") as f:
-            context.append(f"README.md:\n{f.read()[:2000]}\n")
-    
-    # Prioritize core entrypoints, then read up to 3 python files for context
-    py_files = glob.glob(os.path.join(cwd, "*.py"))
-    py_files.sort(key=lambda x: 0 if os.path.basename(x).lower() in ("main.py", "app.py", "config.py") else 1)
-    
-    for pf in py_files[:3]:
-        name = os.path.basename(pf)
-        with open(pf, "r", encoding="utf-8", errors="ignore") as f:
-            context.append(f"{name}:\n{f.read()[:2000]}\n")
-            
-    context_str = "\n".join(context)
-    prompt = f"Based on the following files from my project, tell me what this project is about in a single short paragraph. Do not be overly verbose.\n\n{context_str}"
-    
-    # Call chat() to stream the response naturally
-    chat(prompt, model)
+    run_with_tracking("Hermes Agent", cmd, task, s)
 
 
-# ─── Command handlers ────────────────────────────────────────
+# ─── Process helpers ──────────────────────────────────────────
 
-def cmd_help():
-    print(HELP_TEXT)
+def _kill_process_tree(proc: subprocess.Popen):
+    """Kill a shell command and everything it started (taskkill /T on Windows, the process group elsewhere)."""
+    if proc.poll() is not None:
+        return
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            proc.kill()
 
-def cmd_clear():
-    global system_prompt
-    history.clear()
-    system_prompt = None
+
+def copy_to_clipboard(text: str) -> bool:
+    """Copy text to the system clipboard. Returns False if no clipboard tool is available."""
+    if os.name == "nt":
+        # clip.exe reads UTF-16 with a byte-order mark correctly, which keeps non-ASCII text intact.
+        cmd, data = ["clip"], text.encode("utf-16")
+    elif sys.platform == "darwin":
+        cmd, data = ["pbcopy"], text.encode("utf-8")
+    else:
+        candidates = [["wl-copy"], ["xclip", "-selection", "clipboard"], ["xsel", "--clipboard", "--input"]]
+        cmd = next((c for c in candidates if shutil.which(c[0])), None)
+        if cmd is None:
+            return False
+        data = text.encode("utf-8")
+    try:
+        subprocess.run(cmd, input=data, check=True)
+    except (OSError, subprocess.CalledProcessError):
+        return False
+    return True
+
+
+# ─── Command table ────────────────────────────────────────────
+
+COMMANDS = {}
+
+HELP_SECTIONS = [
+    ("Coding", [
+        ("/code <task>", "Start the coding agent"),
+        ("/hermes [task]", "Start Hermes Agent"),
+        ("/run <cmd>", "Run a shell command (output goes to chat)"),
+    ]),
+    ("Files", [
+        ("/ls [pattern]", "List files (supports glob)"),
+        ("/read <file>", "Read file(s) into chat"),
+        ("/cwd <path>", "Change working directory"),
+        ("/tree", "Show directory tree"),
+        ("/analyze", "Summarize the project"),
+    ]),
+    ("Chat", [
+        ("/system <text>", "Set system prompt ('/system clear' removes it)"),
+        ("/retry", "Regenerate the last reply"),
+        ("/copy", "Copy the last reply to the clipboard"),
+        ("/history", "Show conversation log"),
+        ("/save", "Save chat to a .md file"),
+        ("/clear", "Clear chat history"),
+    ]),
+    ("Config", [
+        ("/model [name]", "Show or change the AI model"),
+        ("/models", "Show default models per provider"),
+        ("/key", "Set up or switch provider (API key or address)"),
+        ("/info", "Show settings and token usage"),
+        ("/reset", "Wipe config and start fresh"),
+    ]),
+    ("General", [
+        ("/help", "Show this help"),
+        ("exit", "Quit"),
+    ]),
+]
+
+
+def command(*names):
+    """Register a handler for one or more slash commands. Handlers take (args, session)."""
+    def register(fn):
+        for name in names:
+            COMMANDS[name] = fn
+        return fn
+    return register
+
+
+def handle_command(line: str, s: Session):
+    parts = line.split(maxsplit=1)
+    name = parts[0].lower()
+    args = parts[1].strip() if len(parts) > 1 else ""
+    handler = COMMANDS.get(name)
+    if handler is None:
+        print(f"  Unknown command: {name}. Type /help\n")
+        return
+    handler(args, s)
+
+
+@command("/help")
+def cmd_help(args, s):
+    table = Table.grid(padding=(0, 2))
+    table.add_column(no_wrap=True)
+    table.add_column()
+    for title, items in HELP_SECTIONS:
+        table.add_row(Text(title, style="bold yellow"), "")
+        for usage, desc in items:
+            table.add_row(Text(f"  {usage}", style="bold cyan"), Text(desc))
+        table.add_row("", "")
+    console.print(Panel(table, title="CLI CODER commands", title_align="left", border_style="dim", expand=False))
+
+
+@command("/clear")
+def cmd_clear(args, s):
+    s.history.clear()
+    s.system_prompt = None
+    s.last_prompt = None
+    s.last_reply = None
     os.system("cls" if os.name == "nt" else "clear")
     print(BANNER)
     print("  Conversation and system prompt cleared.\n")
 
-def cmd_model(args: str, model: str) -> str:
-    if args:
-        from config import save
-        save("CLI_CODER_MODEL", args)
-        print(f"  Model changed to: {args}\n")
-        return args
-    else:
-        print(f"  Current model: {model}\n")
-        return model
 
-def cmd_cwd(args: str):
+@command("/model")
+def cmd_model(args, s):
+    if args:
+        s.model = args
+        config.save(MODEL_ENV, args)
+        print(f"  Model changed to: {args}\n")
+    else:
+        print(f"  Current model: {s.model}")
+        print("  Change it with /model <provider/name>. See /models for the defaults.\n")
+
+
+@command("/models")
+def cmd_models(args, s):
+    print("  Providers (* = current provider):")
+    ready = configured_providers()
+    for p in PROVIDERS:
+        marker = "*" if p.family == provider_of(s.model) else " "
+        status = "ready" if p in ready else "not set up"
+        print(f"   {marker} {p.default_model:<34} {p.name} ({status})")
+    print("  Set one up with /key. Any LiteLLM model string works with /model.")
+    print("  See docs.litellm.ai/docs/providers\n")
+
+
+@command("/cwd")
+def cmd_cwd(args, s):
     if not args:
         print(f"  {os.getcwd()}\n")
     elif os.path.isdir(args):
@@ -309,327 +551,394 @@ def cmd_cwd(args: str):
     else:
         print(f"  [Error] Not a valid directory: {args}\n")
 
-def cmd_ls(args: str):
+
+@command("/ls")
+def cmd_ls(args, s):
     cwd = os.getcwd()
     print(f"\n  {cwd}\n")
     try:
         if args:
             safe_args = os.path.normpath(args)
-            if safe_args.startswith("..") or os.path.isabs(safe_args):
+            if safe_args == ".." or safe_args.startswith(".." + os.sep) or os.path.isabs(safe_args):
                 print("  [Error] Path must be relative and within the current directory.\n")
                 return
-            # Glob pattern
-            entries = sorted(glob.glob(os.path.join(cwd, safe_args)))
-            entries = [os.path.basename(e) for e in entries]
+            entries = sorted(os.path.basename(e) for e in glob.glob(os.path.join(cwd, safe_args)))
         else:
             entries = sorted(os.listdir(cwd))
+
         for entry in entries:
             full = os.path.join(cwd, entry)
             if os.path.isdir(full):
                 print(f"    [DIR]  {entry}/")
             else:
-                size = os.path.getsize(full)
-                if size < 1024:
-                    s = f"{size} B"
-                elif size < 1024 * 1024:
-                    s = f"{size // 1024} KB"
-                else:
-                    s = f"{size // (1024 * 1024)} MB"
-                print(f"    {s:>8}  {entry}")
+                try:
+                    size = os.path.getsize(full)
+                except OSError:
+                    size = 0
+                print(f"    {_format_size(size):>8}  {entry}")
         if not entries:
             print("    (empty)")
         print()
-    except Exception as e:
+    except OSError as e:
         print(f"  [Error] {e}\n")
 
-def cmd_tree(max_depth=3):
-    """Show directory tree of CWD."""
+
+@command("/tree")
+def cmd_tree(args, s, max_depth=3):
     cwd = os.getcwd()
     print(f"\n  {cwd}\n")
-    skip = {'.git', '__pycache__', 'node_modules', '.env_cli', 'venv', '.venv'}
+    skip = {".git", "__pycache__", "node_modules", ".env_cli", "venv", ".venv"}
+
     def _tree(path, prefix, depth):
         if depth > max_depth:
             return
         try:
             entries = sorted(os.listdir(path))
-        except PermissionError:
+        except OSError:
             return
-        entries = [e for e in entries if e not in skip and not e.startswith('.')]
+        entries = [e for e in entries if e not in skip and not e.startswith(".")]
         for i, entry in enumerate(entries):
             full = os.path.join(path, entry)
-            connector = "└── " if i == len(entries) - 1 else "├── "
+            last = i == len(entries) - 1
+            connector = "└── " if last else "├── "
             if os.path.isdir(full):
                 print(f"  {prefix}{connector}{entry}/")
-                ext = "    " if i == len(entries) - 1 else "│   "
-                _tree(full, prefix + ext, depth + 1)
+                _tree(full, prefix + ("    " if last else "│   "), depth + 1)
             else:
                 print(f"  {prefix}{connector}{entry}")
+
     _tree(cwd, "", 0)
     print()
 
-def cmd_read(args: str):
+
+def read_file_text(path: str, limit: int) -> str:
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        return f.read(limit)
+
+
+@command("/read")
+def cmd_read(args, s):
     if not args:
         print("  Usage: /read <filename>\n")
         return
-    # Support multiple files via glob
     cwd = os.getcwd()
-    if '*' in args or '?' in args:
+    if "*" in args or "?" in args:
         matches = glob.glob(os.path.join(cwd, args))
     else:
         target = os.path.join(cwd, args) if not os.path.isabs(args) else args
-        matches = [target] if os.path.isfile(target) else []
+        matches = [target]
+    matches = [m for m in matches if os.path.isfile(m)]
 
     if not matches:
         print(f"  [Error] No files found: {args}\n")
         return
 
+    loaded = 0
     for path in matches:
         name = os.path.relpath(path, cwd)
-        
-        # Prevent reading binary files
         try:
-            with open(path, 'rb') as f:
-                if b'\x00' in f.read(1024):
+            with open(path, "rb") as f:
+                if b"\x00" in f.read(1024):
                     print(f"  [Error] Skipping binary file: {name}\n")
                     continue
-        except Exception:
-            pass
-            
-        try:
-            with open(path, "r", encoding="utf-8", errors="replace") as f:
-                content = f.read(50000)  # Cap at 50KB
-            print(f"\n  ── {name} ──\n")
-            print(content)
-            history.append({"role": "user", "content": f"[File: {name}]\n```\n{content}\n```"})
-            history.append({"role": "assistant", "content": f"I've read `{name}`. Ask me anything about it."})
-        except Exception as e:
+            content = read_file_text(path, MAX_READ_CHARS)
+        except OSError as e:
             print(f"  [Error reading {name}] {e}")
+            continue
+        print(f"\n  ── {name} ──\n")
+        print(content)
+        s.history.append({"role": "user", "content": f"[File: {name}]\n```\n{content}\n```"})
+        s.history.append({"role": "assistant", "content": f"I've read `{name}`. Ask me anything about it."})
+        loaded += 1
 
-    print(f"\n  ({len(matches)} file(s) loaded into chat context.)\n")
+    print(f"\n  ({loaded} file(s) loaded into chat context.)\n")
 
-def cmd_run(args: str):
+
+@command("/run")
+def cmd_run(args, s):
     if not args:
         print("  Usage: /run <command>\n")
         return
     print()
+    timed_out = threading.Event()
     try:
-        # Stream output in real time
         proc = subprocess.Popen(
             args, shell=True, cwd=os.getcwd(),
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1
+            text=True, errors="replace", bufsize=1,
+            start_new_session=os.name != "nt",  # own process group, so the whole command can be killed
         )
-        output_lines = []
+    except OSError as e:
+        print(f"  [Error] {e}\n")
+        return
+
+    def on_timeout():
+        timed_out.set()
+        _kill_process_tree(proc)
+
+    # The timer enforces the limit even while output is still streaming.
+    timer = threading.Timer(RUN_TIMEOUT_SECONDS, on_timeout)
+    timer.daemon = True
+    timer.start()
+
+    output_lines = []
+    try:
         for line in proc.stdout:
             print(line, end="")
             output_lines.append(line)
-        proc.wait(timeout=120)
+        proc.wait()
+    except KeyboardInterrupt:
+        _kill_process_tree(proc)
+        print("\n  [Interrupted]")
+    finally:
+        timer.cancel()
+        proc.stdout.close()
 
-        if proc.returncode != 0:
-            print(f"\n  Exit code: {proc.returncode}")
+    if timed_out.is_set():
+        print(f"  [Error] Command timed out ({RUN_TIMEOUT_SECONDS}s limit).\n")
+    elif proc.returncode:
+        print(f"\n  Exit code: {proc.returncode}")
 
-        # Feed output into chat context
-        output = "".join(output_lines[-50:])  # Last 50 lines max
-        if output.strip():
-            history.append({"role": "user", "content": f"[Ran: {args}]\n```\n{output}\n```"})
-            history.append({"role": "assistant", "content": f"Command `{args}` completed. I can see the output."})
-
-    except subprocess.TimeoutExpired:
-        if os.name == 'nt':
-            subprocess.run(f"taskkill /F /T /PID {proc.pid}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        else:
-            proc.kill()
-        print("  [Error] Command timed out (120s limit).\n")
-    except Exception as e:
-        print(f"  [Error] {e}")
+    # Feed the last 50 lines of output into the chat context.
+    output = "".join(output_lines[-50:])
+    if output.strip():
+        s.history.append({"role": "user", "content": f"[Ran: {args}]\n```\n{output}\n```"})
+        s.history.append({"role": "assistant", "content": f"Command `{args}` completed. I can see the output."})
     print()
 
-def cmd_system(args: str):
-    global system_prompt
+
+@command("/system")
+def cmd_system(args, s):
     if not args:
-        if system_prompt:
-            print(f"  Current system prompt: {system_prompt}\n")
+        if s.system_prompt:
+            print(f"  Current system prompt: {s.system_prompt}\n")
         else:
             print("  No system prompt set. Usage: /system <prompt>\n")
         return
-    system_prompt = args
-    print(f"  System prompt set.\n")
+    if args.lower() == "clear":
+        s.system_prompt = None
+        print("  System prompt cleared.\n")
+        return
+    s.system_prompt = args
+    print("  System prompt set.\n")
 
-def cmd_history():
-    if not history:
+
+@command("/history")
+def cmd_history(args, s):
+    if not s.history:
         print("  No conversation history.\n")
         return
     print()
-    for i, msg in enumerate(history):
+    for i, msg in enumerate(s.history):
         role = "You" if msg["role"] == "user" else "AI "
-        content = msg["content"]
-        if len(content) > 200:
-            content = content[:200] + "..."
-        print(f"  [{i+1:>2}] {role}: {content}")
+        print(f"  [{i + 1:>2}] {role}: {_truncate(msg['content'], 200)}")
     print()
 
-def cmd_save():
+
+@command("/save")
+def cmd_save(args, s):
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"chat_{ts}.md"
     filepath = os.path.join(os.getcwd(), filename)
     try:
         with open(filepath, "w", encoding="utf-8") as f:
             f.write(f"# CLI CODER Chat — {ts}\n\n")
-            f.write(f"**Model:** {os.environ.get('CLI_CODER_MODEL', 'unknown')}\n\n")
-            if system_prompt:
-                f.write(f"**System:** {system_prompt}\n\n")
+            f.write(f"**Model:** {s.model}\n\n")
+            if s.system_prompt:
+                f.write(f"**System:** {s.system_prompt}\n\n")
             f.write("---\n\n")
-            for msg in history:
+            for msg in s.history:
                 role = "**You**" if msg["role"] == "user" else "**AI**"
                 f.write(f"{role}:\n\n{msg['content']}\n\n---\n\n")
         print(f"  Saved to: {filename}\n")
-    except Exception as e:
+    except OSError as e:
         print(f"  [Error] {e}\n")
 
-def cmd_key():
-    from config import setup_api_key, save as cfg_save
-    setup_api_key()
-    from config import DEFAULT_MODELS
-    for key_name, model_name in DEFAULT_MODELS.items():
-        if os.environ.get(key_name):
-            cfg_save("CLI_CODER_MODEL", model_name)
-            print(f"  Model auto-set to: {model_name}\n")
-            return model_name
-    return None
 
-def cmd_info(model: str):
-    print(f"\n  ╭─ Info ──────────────────────────────────╮")
-    print(f"  │  Model   : {model:<30}│")
-    print(f"  │  CWD     : {os.getcwd()[:30]:<30}│")
-    sp = (system_prompt[:27] + "...") if system_prompt and len(system_prompt) > 30 else (system_prompt or "(none)")
-    print(f"  │  System  : {sp:<30}│")
-    print(f"  │  History : {len(history)} messages{'':<20}│")
-    print(f"  │  Tokens  : {total_tokens:<30}│")
-    from config import SUPPORTED_KEYS
-    for k in SUPPORTED_KEYS:
-        val = os.environ.get(k)
-        if val:
-            masked = val[:6] + "..." + val[-4:]
-            print(f"  │  Key     : {masked:<30}│")
-    print(f"  ╰──────────────────────────────────────────╯\n")
-
-def cmd_reset():
-    from config import ENV_PATH
-    confirm = input("  Are you sure? This will delete your saved config. [y/N]: ").strip().lower()
-    if confirm == "y":
-        if ENV_PATH.exists():
-            os.remove(ENV_PATH)
-        history.clear()
-        print("  Config wiped. Restart cli_coder.cmd to set up again.\n")
-        sys.exit(0)
+@command("/copy")
+def cmd_copy(args, s):
+    if not s.last_reply:
+        print("  Nothing to copy yet.\n")
+        return
+    if copy_to_clipboard(s.last_reply):
+        print("  Copied the last reply to the clipboard.\n")
     else:
+        print("  [Error] No clipboard tool found (Windows: clip, macOS: pbcopy, Linux: xclip or wl-copy).\n")
+
+
+@command("/retry")
+def cmd_retry(args, s):
+    if s.last_prompt is None:
+        print("  Nothing to retry yet.\n")
+        return
+    tail = s.history[-2:]
+    is_last_exchange = (
+        len(tail) == 2
+        and tail[0] == {"role": "user", "content": s.last_prompt}
+        and tail[1] == {"role": "assistant", "content": s.last_reply}
+    )
+    if is_last_exchange:
+        del s.history[-2:]
+    if not chat(s.last_prompt, s) and is_last_exchange:
+        s.history.extend(tail)
+
+
+@command("/key")
+def cmd_key(args, s):
+    provider = choose_provider()
+    if provider.family != provider_of(s.model):
+        s.model = provider.default_model
+        config.save(MODEL_ENV, s.model)
+        print(f"  Model auto-set to: {s.model}\n")
+    else:
+        print(f"  Keeping current model: {s.model}\n")
+
+
+@command("/info")
+def cmd_info(args, s):
+    u = s.usage
+    cost_text = f"${u.cost:.4f}"
+    if u.unpriced_replies:
+        cost_text += f" ({u.unpriced_replies} repl{'y' if u.unpriced_replies == 1 else 'ies'} without price data)"
+    rows = [
+        ("Version", __version__),
+        ("Model", s.model),
+        ("CWD", os.getcwd()),
+        ("System prompt", _truncate(s.system_prompt or "(none)", 60)),
+        ("History", f"{len(s.history)} messages"),
+        ("Context budget", f"{CONTEXT_BUDGET_CHARS:,} chars per request"),
+        ("Tokens (session)", f"{u.prompt_tokens:,} in | {u.completion_tokens:,} out"),
+        ("Cost (session)", cost_text),
+    ]
+    for p in PROVIDERS:
+        key_value = os.environ.get(p.key_env) if p.key_env else None
+        if key_value:
+            rows.append((p.key_env, mask_key(key_value)))
+        address = os.environ.get(p.endpoint_env) if p.endpoint_env else None
+        if address:
+            rows.append((p.endpoint_env, address))
+    print_panel("Info", rows)
+
+
+@command("/reset")
+def cmd_reset(args, s):
+    confirm = input("  Are you sure? This will delete your saved config. [y/N]: ").strip().lower()
+    if confirm != "y":
         print("  Cancelled.\n")
+        return
+    if config.ENV_PATH.exists():
+        os.remove(config.ENV_PATH)
+    s.history.clear()
+    print("  Config wiped. Restart cli_coder.cmd to set up again.\n")
+    sys.exit(0)
+
+
+@command("/analyze", "/analyse")
+def cmd_analyze(args, s):
+    cwd = os.getcwd()
+    print("\n  Analyzing project... (reading context)")
+    context = []
+
+    readme_path = os.path.join(cwd, "README.md")
+    if os.path.isfile(readme_path):
+        context.append(f"README.md:\n{read_file_text(readme_path, 2000)}\n")
+
+    # Prioritize core entrypoints, then read up to 3 python files for context
+    py_files = glob.glob(os.path.join(cwd, "*.py"))
+    py_files.sort(key=lambda x: 0 if os.path.basename(x).lower() in ("main.py", "app.py", "config.py") else 1)
+    for path in py_files[:3]:
+        context.append(f"{os.path.basename(path)}:\n{read_file_text(path, 2000)}\n")
+
+    context_str = "\n".join(context)
+    prompt = (
+        "Based on the following files from my project, tell me what this project is about "
+        "in a single short paragraph. Do not be overly verbose.\n\n" + context_str
+    )
+    chat(prompt, s)
+
+
+@command("/code")
+def cmd_code(args, s):
+    if not args:
+        print("  Usage: /code <describe what you want built, fixed, or analyzed>\n")
+        return
+    # Fast path for simple analysis requests, so they skip the slower agent loop
+    if args.lower() in ANALYSIS_WORDS:
+        cmd_analyze("", s)
+        return
+    run_code_agent(args, s)
+
+
+@command("/hermes")
+def cmd_hermes(args, s):
+    run_hermes(args, s)
 
 
 # ─── Main loop ────────────────────────────────────────────────
 
-def main():
-    os.system("cls" if os.name == "nt" else "clear")
-    print(BANNER)
-
-    ensure_setup()
-
-    model = os.environ.get("CLI_CODER_MODEL", "gemini/gemini-3.5-flash")
-    print(f"  Model : {model}")
-    print(f"  CWD   : {os.getcwd()}")
-    print(HELP_TEXT)
-
+def repl(s: Session):
     while True:
         try:
             user_input = input("You > ").strip()
         except (KeyboardInterrupt, EOFError):
             print("\nGoodbye!")
-            break
+            return
 
         if not user_input:
             continue
-
-        low = user_input.lower()
-
-        # --- Commands ---
-        if low in ("exit", "quit"):
+        if user_input.lower() in ("exit", "quit"):
             print("Goodbye!")
-            break
+            return
 
-        if low == "/help":
-            cmd_help(); continue
+        try:
+            if user_input.startswith("/"):
+                handle_command(user_input, s)
+            else:
+                chat(user_input, s)
+        except KeyboardInterrupt:
+            print("\n  [Interrupted]\n")
 
-        if low == "/clear":
-            cmd_clear(); continue
 
-        if low.startswith("/model"):
-            model = cmd_model(user_input[6:].strip(), model); continue
+def _use_utf8_output():
+    """Box-drawing and Markdown characters crash cp1252 when output is piped or redirected on Windows."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
 
-        if low.startswith("/cwd"):
-            cmd_cwd(user_input[4:].strip()); continue
 
-        if low.startswith("/ls"):
-            cmd_ls(user_input[3:].strip()); continue
+def main(argv=None) -> int:
+    _use_utf8_output()
+    parser = argparse.ArgumentParser(
+        prog="main.py",
+        description="CLI CODER: terminal AI assistant. Run with no arguments to start the chat.",
+    )
+    parser.add_argument("prompt", nargs="*", help="ask one question, print the answer and exit")
+    parser.add_argument("--version", action="version", version=f"CLI CODER {__version__}")
+    args = parser.parse_args(argv)
 
-        if low == "/tree":
-            cmd_tree(); continue
+    if not args.prompt:
+        os.system("cls" if os.name == "nt" else "clear")
+        print(BANNER)
 
-        if low.startswith("/analyze") or low.startswith("/analyse"):
-            cmd_analyze(model); continue
+    try:
+        model = ensure_setup()
+    except (KeyboardInterrupt, EOFError):
+        print("\n  Setup cancelled.")
+        return 1
 
-        if low.startswith("/read"):
-            cmd_read(user_input[5:].strip()); continue
+    s = Session(model=model)
 
-        if low.startswith("/run"):
-            cmd_run(user_input[4:].strip()); continue
+    if args.prompt:
+        return 0 if chat(" ".join(args.prompt), s) else 1
 
-        if low.startswith("/system"):
-            cmd_system(user_input[7:].strip()); continue
-
-        if low == "/history":
-            cmd_history(); continue
-
-        if low == "/save":
-            cmd_save(); continue
-
-        if low == "/key":
-            new_model = cmd_key()
-            if new_model:
-                model = new_model
-            continue
-
-        if low == "/info":
-            cmd_info(model); continue
-
-        if low == "/reset":
-            cmd_reset(); continue
-
-        if low.startswith("/code"):
-            task = user_input[5:].strip()
-            if not task:
-                print("  Usage: /code <describe what you want built, fixed, or analyzed>\n")
-                continue
-            
-            # Fast-path for simple analysis to avoid SWE agent rate limits
-            if task.lower() in ("analyse", "analyze", "summarize", "explain", "summary"):
-                cmd_analyze(model)
-                continue
-                
-            run_code_agent(task, model)
-            continue
-            
-        if low.startswith("/hermes"):
-            task = user_input[7:].strip()
-            cmd_hermes(task)
-            continue
-
-        if low.startswith("/"):
-            print(f"  Unknown command: {user_input.split()[0]}. Type /help\n")
-            continue
-
-        # --- Normal chat (streamed) ---
-        chat(user_input, model)
+    print(f"  Model : {s.model}")
+    print(f"  CWD   : {os.getcwd()}\n")
+    cmd_help("", s)
+    repl(s)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
